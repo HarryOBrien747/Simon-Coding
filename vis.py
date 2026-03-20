@@ -1,349 +1,403 @@
-import argparse
-import glob
-import os
+# vis.py — read plain-text state/energy from Hermite Fortran run and save PNGs
+# Outputs:
+#   COM_drift.png
+#   energy_err.png
+#   helilocentric_distances.png
+#   orbits_xy.png
+#   orbits_xy_innerplanetsincludingjuipter.png
+#   orbits_xy_innerplanets_to_mars.png
+
+import matplotlib
+matplotlib.use("Agg")  # save-only backend (no GUI)
+
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
+from pathlib import Path
+from glob import glob
 
-G = 6.67430e-11
-pc = 3.085677581e16
-Myr = 1.0e6 * 365.25 * 86400.0
+BASE = Path.cwd()
 
-def newest(glob_pattern: str):
-    files = glob.glob(glob_pattern)
-    if not files:
-        return None
-    files.sort(key=os.path.getmtime)
-    return files[-1]
+# ---------- locate newest state_*/energy_* files ----------
+'''
+def find_latest(prefix: str) -> Path:
+    # Accept timestamped names from Fortran, with or without .txt/.csv
+    pats = [f"{prefix}*.txt", f"{prefix}*.csv", f"{prefix}*"]
+    cands = [Path(p) for pat in pats for p in glob(str(BASE / pat))]
+    if not cands:
+        # Fallback to plain 'state'/'energy' names if user saved fixed names
+        p = BASE / prefix.rstrip("_")
+        if p.exists():
+            return p
+        ptxt = p.with_suffix(".txt")
+        if ptxt.exists():
+            return ptxt
+        raise FileNotFoundError(f"No files matching {prefix}* in {BASE}")
+    return max(cands, key=lambda p: p.stat().st_mtime)
+'''
 
-def infer_N_from_header(state_file: str) -> int:
-    with open(state_file, "r") as f:
-        header = f.readline().strip().split()
-    # header: t[s] then 6N columns
-    ncols = len(header) - 1
-    if ncols % 6 != 0:
-        raise ValueError(f"State header columns not divisible by 6: got {ncols}")
-    return ncols // 6
+def find_latest(prefix: str) -> Path:
+    # Accept timestamped names from Fortran, with .txt/.csv
+    pats = [f"{prefix}*.txt", f"{prefix}*.csv"]
+    cands = [Path(p) for pat in pats for p in glob(str(BASE / pat))]
+    if not cands:
+        # Fallback to plain 'state'/'energy' if user saved fixed names
+        p = BASE / prefix.rstrip("_")
+        if p.exists():
+            return p
+        ptxt = p.with_suffix(".txt")
+        if ptxt.exists():
+            return ptxt
+        raise FileNotFoundError(f"No files matching {prefix}*.txt or {prefix}*.csv in {BASE}")
+    return max(cands, key=lambda p: p.stat().st_mtime)
 
-def count_snapshots(state_file: str) -> int:
-    n = 0
-    with open(state_file, "r") as f:
-        _ = f.readline()  # header
-        for line in f:
-            if line.strip():
-                n += 1
-    return n
 
-def read_energy(energy_file: str):
-    data = np.loadtxt(energy_file, skiprows=1)
-    if data.ndim == 1:
-        data = data[None, :]
-    t = data[:, 0]
-    E = data[:, 1]
-    dE = data[:, 2]
-    return t, E, dE
+state_path  = find_latest("state_")
+energy_path = find_latest("energy_")
 
-def try_read_masses(mass_file: str, N: int):
-    if mass_file is None:
-        return None
-    if not os.path.exists(mass_file):
-        return None
-    m = np.loadtxt(mass_file)
-    if m.ndim != 1 or m.size != N:
-        print(f"[warn] mass file exists but size mismatch: expected {N}, got {m.size}")
-        return None
-    return m
+# ---------- read files ----------
+state  = pd.read_csv(state_path,  sep=r"\s+", engine="python")
+energy = pd.read_csv(energy_path, sep=r"\s+", engine="python")
 
-def r50_r90_number(radii):
-    rs = np.sort(radii)
-    r50 = rs[int(0.50 * (len(rs) - 1))]
-    r90 = rs[int(0.90 * (len(rs) - 1))]
-    return r50, r90
+# ---------- constants (must match Fortran, up to scaling) ----------
+AU   = 1.495978707e11
+day  = 86400.0
+year = 365.25 * day
 
-def lagrange_radii_mass(radii, masses, fracs=(0.1, 0.5, 0.9)):
-    idx = np.argsort(radii)
-    r_sorted = radii[idx]
-    m_sorted = masses[idx]
-    cum = np.cumsum(m_sorted)
-    tot = cum[-1]
-    out = []
-    for f in fracs:
-        target = f * tot
-        j = np.searchsorted(cum, target)
-        j = min(max(j, 0), len(r_sorted) - 1)
-        out.append(r_sorted[j])
-    return out  # same order as fracs
+# ---------- infer number of bodies ----------
+cols = list(state.columns)
+if cols[0] != "t[s]":
+    raise RuntimeError("First column must be 't[s]'. Check the state header.")
+N = (len(cols) - 1) // 6
+if 1 + 6 * N != len(cols):
+    raise RuntimeError(f"Column count mismatch: got {len(cols)} but expected 1 + 6*N.")
 
-def velocity_dispersion(v):
-    # 1D dispersion (unweighted): std over all components
-    vx, vy, vz = v[:, 0], v[:, 1], v[:, 2]
-    sigx = np.std(vx)
-    sigy = np.std(vy)
-    sigz = np.std(vz)
-    sigma1d = (sigx + sigy + sigz) / 3.0
-    vrms = np.sqrt(np.mean(vx*vx + vy*vy + vz*vz))
-    return sigma1d, vrms
+# ---------- names & masses ----------
+# Order must match your Fortran: Sun, Mercury, Venus, Earth, Moon, Mars, ...
+default_names  = ["Sun","Mercury","Venus","Earth","Moon","Mars",
+                  "Jupiter","Saturn","Uranus","Neptune","Pluto"]
 
-def approximate_escapers(radii, speeds, Mtot):
-    # crude: v > sqrt(2GM/r)
-    # avoid r=0:
-    r = np.maximum(radii, 1e-30)
-    vesc = np.sqrt(2.0 * G * Mtot / r)
-    return np.sum(speeds > vesc)
+# Match your updated Fortran: Mercury and Moon are massless (0.0)
+default_masses = np.array([
+    1.98847e30,   # Sun
+    0.0,          # Mercury (massless in this experiment)
+    4.8675e24,    # Venus
+    5.9722e24,    # Earth
+    0.0,          # Moon (massless in this experiment)
+    6.4171e23,    # Mars
+    1.89813e27,   # Jupiter
+    5.6834e26,    # Saturn
+    8.6810e25,    # Uranus
+    1.02413e26,   # Neptune
+    1.303e22      # Pluto
+], dtype=float)
 
-def select_ids(N, m=None, k=10):
-    if m is not None:
-        # top-mass stars
-        return np.argsort(m)[-k:]
-    # otherwise first k
-    return np.arange(min(k, N))
+if N <= len(default_names):
+    names  = default_names[:N]
+    masses = default_masses[:N]
+else:
+    names  = default_names + [f"Body{i}" for i in range(len(default_names)+1, N+1)]
+    pad    = np.full(N - len(default_masses), 1.0, dtype=float)
+    masses = np.concatenate([default_masses, pad])
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--state", default=None, help="cluster_state_*.txt (default: newest)")
-    ap.add_argument("--energy", default=None, help="cluster_energy_*.txt (default: newest)")
-    ap.add_argument("--masses", default=None, help="optional cluster_masses_*.txt (default: try newest)")
-    ap.add_argument("--traj_k", type=int, default=10, help="how many sample trajectories to plot")
-    ap.add_argument("--outdir", default="plots", help="output folder for figures")
-    ap.add_argument("--virial_stride", type=int, default=0,
-                    help="if >0 and masses provided, compute virial ratio every Nth snapshot (can be slow)")
-    args = ap.parse_args()
+# Bodies we never want to plot (massless test particles)
+SKIP_BODIES = {"Mercury", "Moon"}
 
-    state_file = args.state or newest("cluster_state_*.txt")
-    energy_file = args.energy or newest("cluster_energy_*.txt")
-    if state_file is None or energy_file is None:
-        raise FileNotFoundError("Could not find cluster_state_*.txt and/or cluster_energy_*.txt in this folder.")
+# ---------- convenience column accessor ----------
+def col(sym: str, i: int) -> np.ndarray:
+    return state[f"{sym}{i}"].to_numpy()
 
-    N = infer_N_from_header(state_file)
-    nsnap = count_snapshots(state_file)
-    mid_idx = nsnap // 2
-    end_idx = nsnap - 1
+t_years = state["t[s]"].to_numpy() / year
 
-    mass_file = args.masses
-    if mass_file is None:
-        mass_file = newest("cluster_masses_*.txt")  # optional
-    m = try_read_masses(mass_file, N)
-    Mtot = np.sum(m) if m is not None else None
+# ================================================================
+#  PLOTS
+# ================================================================
 
-    os.makedirs(args.outdir, exist_ok=True)
+# ---------- ORBITS: all bodies (x–y) ----------
+plt.figure(figsize=(9, 7))
+for k, label in enumerate(names, start=1):
+    if label in SKIP_BODIES:
+        continue
+    plt.plot(col("x", k)/AU, col("y", k)/AU, label=label, linewidth=0.9)
+plt.axis("equal")
+plt.xlabel("x [AU]")
+plt.ylabel("y [AU]")
+plt.title("Orbits (barycentric COM frame)")
+plt.legend(fontsize=8, ncol=2 if N <= 10 else 3, frameon=False)
+plt.tight_layout()
+plt.savefig(BASE / "orbits_xy.png", dpi=200)
+plt.close()
 
-    # --- energy plots ---
-    tE, E, dE = read_energy(energy_file)
-    tE_myr = tE / Myr
+# ---------- ORBITS: inner planets up to Jupiter ----------
+plt.figure(figsize=(8, 6))
+for k, label in enumerate(names, start=1):
+    if label in SKIP_BODIES:
+        continue
+    # keep only Venus, Earth, Mars, Jupiter
+    if label not in {"Venus", "Earth", "Mars", "Jupiter"}:
+        continue
+    plt.plot(col("x", k)/AU, col("y", k)/AU, label=label, linewidth=1.0)
+plt.axis("equal")
+plt.xlim(-6, 6)
+plt.ylim(-6, 6)
+plt.xlabel("x [AU]")
+plt.ylabel("y [AU]")
+plt.title("Inner orbits (including Jupiter)")
+plt.legend(fontsize=8, frameon=False)
+plt.tight_layout()
+plt.savefig(BASE / "orbits_xy_innerplanetsincludingjuipter.png", dpi=200)
+plt.close()
 
-    plt.figure()
-    plt.plot(tE_myr, dE)
-    plt.xlabel("Time [Myr]")
-    plt.ylabel("dE / E0")
-    plt.title("Energy Error")
-    plt.grid(True)
-    plt.savefig(os.path.join(args.outdir, "energy_error.png"), dpi=200, bbox_inches="tight")
-    plt.close()
+# ---------- ORBITS: inner planets up to Mars (no Jupiter) ----------
+plt.figure(figsize=(8, 6))
+for k, label in enumerate(names, start=1):
+    if label in SKIP_BODIES:
+        continue
+    # keep only Venus, Earth, Mars
+    if label not in {"Venus", "Earth", "Mars"}:
+        continue
+    plt.plot(col("x", k)/AU, col("y", k)/AU, label=label, linewidth=1.0)
+plt.axis("equal")
+plt.xlim(-2.5, 2.5)
+plt.ylim(-2.5, 2.5)
+plt.xlabel("x [AU]")
+plt.ylabel("y [AU]")
+plt.title("Inner orbits (up to Mars)")
+plt.legend(fontsize=8, frameon=False)
+plt.tight_layout()
+plt.savefig(BASE / "orbits_xy_innerplanets_to_mars.png", dpi=200)
+plt.close()
 
-    plt.figure()
-    plt.plot(tE_myr, E)
-    plt.xlabel("Time [Myr]")
-    plt.ylabel("Total Energy [J]")
-    plt.title("Total Energy")
-    plt.grid(True)
-    plt.savefig(os.path.join(args.outdir, "total_energy.png"), dpi=200, bbox_inches="tight")
-    plt.close()
+# ---------- HELIOCENTRIC distances (skip Mercury & Moon) ----------
+'''
+sun_idx = 1  # Sun is body 1 in your output
 
-    # --- prepare time series containers from state ---
-    times = np.zeros(nsnap)
-    r50_num = np.zeros(nsnap)
-    r90_num = np.zeros(nsnap)
-    sigma1d = np.zeros(nsnap)
-    vrms = np.zeros(nsnap)
-    escapers = np.zeros(nsnap, dtype=int)
+def heliodist(i: int) -> np.ndarray:
+    dx = col("x", i) - col("x", sun_idx)
+    dy = col("y", i) - col("y", sun_idx)
+    dz = col("z", i) - col("z", sun_idx)
+    return np.sqrt(dx*dx + dy*dy + dz*dz) / AU
 
-    # optional mass-based
-    r10_m = r50_m = r90_m = None
-    seg_top = seg_bot = None
-    Q_vir = None
-    Q_t = None
+# linear-scale version (old one)
+plt.figure(figsize=(9, 7))
+for k, label in enumerate(names, start=1):
+    if k == sun_idx:
+        continue
+    if label in SKIP_BODIES:
+        continue
+    if label.lower() == "moon":
+        continue
+    plt.plot(t_years, heliodist(k), label=label, linewidth=1.0)
+plt.xlabel("Time [years]")
+plt.ylabel("Distance to Sun [AU]")
+plt.title("Heliocentric distances")
+plt.legend(fontsize=8, ncol=2, frameon=False)
+plt.tight_layout()
+plt.savefig(BASE / "helilocentric_distances.png", dpi=200)
+plt.close()
+'''
+# log-scale version
+'''
+plt.figure(figsize=(9, 7))
+for k, label in enumerate(names, start=1):
+    if k == sun_idx:
+        continue
+    if label in SKIP_BODIES:
+        continue
+    if label.lower() == "moon":
+        continue
+    plt.plot(t_years, heliodist(k), label=label, linewidth=1.0)
+plt.xlabel("Time [years]")
+plt.ylabel("Distance to Sun [AU]")
+plt.title("Heliocentric distances (log scale)")
+plt.yscale("log")
+plt.grid(True, which="both", linestyle=":")
+plt.legend(fontsize=8, ncol=2, frameon=False)
+plt.tight_layout()
+plt.savefig(BASE / "helilocentric_distances_log.png", dpi=200)
+plt.close()
 
-    if m is not None:
-        r10_m = np.zeros(nsnap)
-        r50_m = np.zeros(nsnap)
-        r90_m = np.zeros(nsnap)
-        seg_top = np.zeros(nsnap)  # mean radius of top 10% mass
-        seg_bot = np.zeros(nsnap)  # mean radius of bottom 50% mass
+'''
+'''
+plt.figure(figsize=(9, 7))
+for k, label in enumerate(names, start=1):
+    if k == sun_idx:
+        continue
+    if label in SKIP_BODIES:
+        continue
+    if label.lower() == "moon":
+        continue
+    r = heliodist(k)
+    frac = (r - r.mean()) / r.mean()   # fractional deviation
+    plt.plot(t_years, frac * 100.0, label=label, linewidth=1.0)
 
-        if args.virial_stride > 0:
-            Q_vir = []
-            Q_t = []
+plt.xlabel("Time [years]")
+plt.ylabel("Δr / ⟨r⟩ [%]")
+plt.title("Fractional heliocentric distance variation")
+plt.grid(True, linestyle=":")
+plt.legend(fontsize=8, ncol=2, frameon=False)
+plt.tight_layout()
+plt.savefig(BASE / "helilocentric_distances_frac.png", dpi=200)
+plt.close()
+'''
 
-    # sample trajectories
-    ids = select_ids(N, m=m, k=args.traj_k)
-    traj_x = {i: [] for i in ids}
-    traj_y = {i: [] for i in ids}
+# ---------- HELIOCENTRIC distances (skip Mercury & Moon) ----------
+sun_idx = 1  # Sun is body 1 in your output
 
-    # radial hist snapshots
-    hist_data = {}
+def heliodist(i: int) -> np.ndarray:
+    dx = col("x", i) - col("x", sun_idx)
+    dy = col("y", i) - col("y", sun_idx)
+    dz = col("z", i) - col("z", sun_idx)
+    return np.sqrt(dx*dx + dy*dy + dz*dz) / AU
 
-    # read state snapshots streaming (fast-ish)
-    with open(state_file, "r") as f:
-        _ = f.readline()  # header
-        for s, line in enumerate(f):
-            if not line.strip():
-                continue
-            arr = np.fromstring(line, sep=" ")
-            t = arr[0]
-            data = arr[1:].reshape(N, 6)
-            pos = data[:, 0:3]
-            vel = data[:, 3:6]
+# --- 1) linear-scale distances (all planets except massless ones) ---
+plt.figure(figsize=(9, 7))
+for k, label in enumerate(names, start=1):
+    if k == sun_idx:
+        continue
+    if label in SKIP_BODIES:
+        continue
+    if label.lower() == "moon":
+        continue
+    plt.plot(t_years, heliodist(k), label=label, linewidth=1.0)
 
-            rmag = np.sqrt(np.sum(pos*pos, axis=1))     # [m]
-            speed = np.sqrt(np.sum(vel*vel, axis=1))    # [m/s]
+plt.xlabel("Time [years]")
+plt.ylabel("Distance to Sun [AU]")
+plt.title("Heliocentric distances")
+plt.legend(fontsize=8, ncol=2, frameon=False)
+plt.tight_layout()
+plt.savefig(BASE / "helilocentric_distances.png", dpi=200)
+plt.close()
 
-            times[s] = t
-            r50_num[s], r90_num[s] = r50_r90_number(rmag)
+# --- 2) log-scale distances (all planets) ---
+plt.figure(figsize=(9, 7))
+for k, label in enumerate(names, start=1):
+    if k == sun_idx:
+        continue
+    if label in SKIP_BODIES:
+        continue
+    if label.lower() == "moon":
+        continue
+    plt.plot(t_years, heliodist(k), label=label, linewidth=1.0)
 
-            sig, v_rms = velocity_dispersion(vel)
-            sigma1d[s] = sig
-            vrms[s] = v_rms
+plt.xlabel("Time [years]")
+plt.ylabel("Distance to Sun [AU]")
+plt.title("Heliocentric distances (log scale)")
+plt.yscale("log")
+plt.grid(True, which="both", linestyle=":")
+plt.legend(fontsize=8, ncol=2, frameon=False)
+plt.tight_layout()
+plt.savefig(BASE / "helilocentric_distances_log.png", dpi=200)
+plt.close()
 
-            # approximate escapers needs total mass; if masses missing, we can’t do v_esc meaningfully
-            if Mtot is not None:
-                escapers[s] = approximate_escapers(rmag, speed, Mtot)
-            else:
-                escapers[s] = 0
+# --- 3a) fractional variation: inner (Venus–Earth–Mars–Jupiter) ---
+inner_frac_bodies = {"Venus", "Earth", "Mars", "Jupiter"}
 
-            # trajectories (XY)
-            for i in ids:
-                traj_x[i].append(pos[i, 0] / pc)
-                traj_y[i].append(pos[i, 1] / pc)
+plt.figure(figsize=(9, 7))
+for k, label in enumerate(names, start=1):
+    if label not in inner_frac_bodies:
+        continue
+    if label in SKIP_BODIES:
+        continue
+    r = heliodist(k)
+    frac = (r - r.mean()) / r.mean()   # fractional deviation from mean
+    plt.plot(t_years, frac * 100.0, label=label, linewidth=1.0)
 
-            # radial hists at start/mid/end
-            if s in (0, mid_idx, end_idx):
-                hist_data[s] = rmag / pc
+plt.xlabel("Time [years]")
+plt.ylabel("Δr / ⟨r⟩ [%]")
+plt.title("Fractional heliocentric distance variation (inner planets)")
+plt.grid(True, linestyle=":")
+plt.legend(fontsize=8, ncol=2, frameon=False)
+plt.tight_layout()
+plt.savefig(BASE / "helilocentric_distances_frac_inner.png", dpi=200)
+plt.close()
 
-            # mass-based metrics (if available)
-            if m is not None:
-                r10, r50, r90 = lagrange_radii_mass(rmag, m, fracs=(0.1, 0.5, 0.9))
-                r10_m[s], r50_m[s], r90_m[s] = r10, r50, r90
+# --- 3b) fractional variation: outer (Saturn–Uranus–Neptune–Pluto) ---
+outer_frac_bodies = {"Saturn", "Uranus", "Neptune", "Pluto"}
 
-                # mass segregation proxy: mean radius top 10% mass vs bottom 50%
-                idx_sorted = np.argsort(m)
-                bot = idx_sorted[: max(1, N//2)]
-                top = idx_sorted[int(0.9*N):]
-                seg_bot[s] = np.mean(rmag[bot]) / pc
-                seg_top[s] = np.mean(rmag[top]) / pc
+plt.figure(figsize=(9, 7))
+for k, label in enumerate(names, start=1):
+    if label not in outer_frac_bodies:
+        continue
+    if label in SKIP_BODIES:
+        continue
+    r = heliodist(k)
+    frac = (r - r.mean()) / r.mean()
+    plt.plot(t_years, frac * 100.0, label=label, linewidth=1.0)
 
-                # optional virial ratio (expensive if done every snapshot)
-                if args.virial_stride > 0 and (s % args.virial_stride == 0):
-                    # Kinetic energy
-                    T = 0.5 * np.sum(m * np.sum(vel*vel, axis=1))
-                    # Potential energy exact O(N^2) with a loop (N=1000 ok if not too frequent)
-                    U = 0.0
-                    for i in range(N-1):
-                        rij = pos[i+1:] - pos[i]
-                        dist = np.sqrt(np.sum(rij*rij, axis=1))
-                        U -= G * m[i] * np.sum(m[i+1:] / np.maximum(dist, 1e-30))
-                    Q = 2.0 * T / abs(U)
-                    Q_vir.append(Q)
-                    Q_t.append(t / Myr)
+plt.xlabel("Time [years]")
+plt.ylabel("Δr / ⟨r⟩ [%]")
+plt.title("Fractional heliocentric distance variation (outer planets)")
+plt.grid(True, linestyle=":")
+plt.legend(fontsize=8, ncol=2, frameon=False)
+plt.tight_layout()
+plt.savefig(BASE / "helilocentric_distances_frac_outer.png", dpi=200)
+plt.close()
 
-    t_myr = times / Myr
 
-    # --- plots from state series ---
-    plt.figure()
-    plt.plot(t_myr, r50_num/pc, label="R50 (by number)")
-    plt.plot(t_myr, r90_num/pc, label="R90 (by number)")
-    plt.xlabel("Time [Myr]")
-    plt.ylabel("Radius [pc]")
-    plt.title("Cluster Size (Number Lagrange Radii)")
-    plt.grid(True)
-    plt.legend()
-    plt.savefig(os.path.join(args.outdir, "r50_r90_number.png"), dpi=200, bbox_inches="tight")
-    plt.close()
+# ---------- ENERGY error (log scale) ----------
+plt.figure(figsize=(9, 7))
+if "dE/E0" in energy.columns:
+    plt.plot(energy["t[s]"] / year, np.abs(energy["dE/E0"]))
+else:
+    e = energy["E[J]"].to_numpy()
+    plt.plot(energy["t[s]"] / year, np.abs((e - e[0]) / e[0]))
+plt.yscale("log")
+plt.xlabel("Time [years]")
+plt.ylabel("|ΔE/E0|")
+plt.title("Relative Energy Error")
+plt.grid(True, which="both", linestyle=":")
+plt.tight_layout()
+plt.savefig(BASE / "energy_err.png", dpi=200)
+plt.close()
 
-    plt.figure()
-    plt.plot(t_myr, sigma1d/1e3, label="sigma_1D")
-    plt.plot(t_myr, vrms/1e3, label="v_rms")
-    plt.xlabel("Time [Myr]")
-    plt.ylabel("Velocity [km/s]")
-    plt.title("Velocity Dispersion")
-    plt.grid(True)
-    plt.legend()
-    plt.savefig(os.path.join(args.outdir, "velocity_dispersion.png"), dpi=200, bbox_inches="tight")
-    plt.close()
+# ---------- COM drift (barycentric) ----------
+Mtot = masses.sum()
+xcom = np.zeros(len(state))
+ycom = np.zeros(len(state))
+zcom = np.zeros(len(state))
+for k in range(1, N + 1):
+    # if our names array is shorter than masses (for weird N), guard index
+    if k-1 >= len(masses):
+        break
+    xcom += masses[k-1] * col("x", k)
+    ycom += masses[k-1] * col("y", k)
+    zcom += masses[k-1] * col("z", k)
+xcom /= Mtot
+ycom /= Mtot
+zcom /= Mtot
+com_mag = np.sqrt(xcom*xcom + ycom*ycom + zcom*zcom) / AU
 
-    plt.figure()
-    plt.plot(t_myr, escapers)
-    plt.xlabel("Time [Myr]")
-    plt.ylabel("N(escapers) [approx]")
-    plt.title("Approx Escapers vs Time")
-    plt.grid(True)
-    plt.savefig(os.path.join(args.outdir, "escapers_approx.png"), dpi=200, bbox_inches="tight")
-    plt.close()
+plt.figure(figsize=(9, 7))
+plt.plot(t_years, com_mag)
+plt.yscale("log")
+plt.xlabel("Time [years]")
+plt.ylabel("|r_com| [AU]")
+plt.title("COM Drift")
+plt.grid(True, which="both", linestyle=":")
+plt.tight_layout()
+plt.savefig(BASE / "COM_drift.png", dpi=200)
+plt.close()
 
-    # radial histograms start/mid/end
-    plt.figure()
-    for idx, label in [(0, "start"), (mid_idx, "mid"), (end_idx, "end")]:
-        if idx in hist_data:
-            plt.hist(hist_data[idx], bins=40, histtype="step", label=label, density=True)
-    plt.xlabel("r [pc]")
-    plt.ylabel("Probability density")
-    plt.title("Radial Distribution (start / mid / end)")
-    plt.grid(True)
-    plt.legend()
-    plt.savefig(os.path.join(args.outdir, "radial_histograms.png"), dpi=200, bbox_inches="tight")
-    plt.close()
+# ---------- console summary ----------
+if "dE/E0" in energy.columns:
+    de = np.abs(energy["dE/E0"].to_numpy())
+else:
+    e = energy["E[J]"].to_numpy()
+    de = np.abs((e - e[0]) / e[0])
+de_max = float(np.nanmax(de))
 
-    # sample XY trajectories
-    plt.figure()
-    for i in ids:
-        plt.plot(traj_x[i], traj_y[i], linewidth=1)
-    plt.xlabel("x [pc]")
-    plt.ylabel("y [pc]")
-    plt.title(f"Sample XY Trajectories (N={len(ids)})")
-    plt.grid(True)
-    plt.savefig(os.path.join(args.outdir, "sample_xy_trajectories.png"), dpi=200, bbox_inches="tight")
-    plt.close()
-
-    # mass-based plots if masses exist
-    if m is not None:
-        plt.figure()
-        plt.plot(t_myr, r10_m, label="R10 (mass)")
-        plt.plot(t_myr, r50_m, label="R50 (mass)")
-        plt.plot(t_myr, r90_m, label="R90 (mass)")
-        plt.xlabel("Time [Myr]")
-        plt.ylabel("Radius [pc]")
-        plt.title("Mass Lagrange Radii")
-        plt.grid(True)
-        plt.legend()
-        plt.savefig(os.path.join(args.outdir, "lagrange_radii_mass.png"), dpi=200, bbox_inches="tight")
-        plt.close()
-
-        plt.figure()
-        plt.plot(t_myr, seg_top, label="Mean r (top 10% mass)")
-        plt.plot(t_myr, seg_bot, label="Mean r (bottom 50% mass)")
-        plt.xlabel("Time [Myr]")
-        plt.ylabel("Mean radius [pc]")
-        plt.title("Mass Segregation Proxy")
-        plt.grid(True)
-        plt.legend()
-        plt.savefig(os.path.join(args.outdir, "mass_segregation_proxy.png"), dpi=200, bbox_inches="tight")
-        plt.close()
-
-        if Q_vir is not None and len(Q_vir) > 0:
-            plt.figure()
-            plt.plot(Q_t, Q_vir)
-            plt.xlabel("Time [Myr]")
-            plt.ylabel("Q = 2T/|U|")
-            plt.title(f"Virial Ratio (every {args.virial_stride} snapshots)")
-            plt.grid(True)
-            plt.savefig(os.path.join(args.outdir, "virial_ratio.png"), dpi=200, bbox_inches="tight")
-            plt.close()
-
-    print(f"Done. Saved plots to: {args.outdir}")
-    print(f"Used state:  {state_file}")
-    print(f"Used energy: {energy_file}")
-    if m is not None:
-        print(f"Used masses: {mass_file}")
-    else:
-        print("No mass file found -> mass-weighted plots + virial ratio skipped.")
-
-if __name__ == "__main__":
-    main()
+print(f"Read files:\n  {state_path.name}\n  {energy_path.name}")
+print("Saved images:\n"
+      "  COM_drift.png\n"
+      "  energy_err.png\n"
+      "  helilocentric_distances.png\n"
+      "  helilocentric_distances_log.png\n"
+      "  helilocentric_distances_frac_inner.png\n"
+      "  helilocentric_distances_frac_outer.png\n"
+      "  orbits_xy.png\n"
+      "  orbits_xy_innerplanetsincludingjuipter.png\n"
+      "  orbits_xy_innerplanets_to_mars.png")
+print(f"Detected N={N} bodies: {', '.join(names)}")
+print(f"Max |ΔE/E0| ≈ {de_max:.3e}")
+print(f"Max COM offset ≈ {np.nanmax(com_mag):.3e} AU")
